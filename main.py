@@ -88,6 +88,14 @@ elif opt.dataset == 'cifar10':
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
         ]))
+elif opt.dataset == 'cxr':
+    dataset = ImageFolder(
+        root=opt.dataroot,
+        transform=transforms.Compose([
+            transforms.Scale(opt.imageSize),
+            transforms.ToTensor(),
+        ]))
+
 else:
     raise NotImplementedError("No such dataset {}".format(opt.dataset))
 
@@ -106,8 +114,11 @@ nc = 3
 # Define the generator and initialize the weights
 if opt.dataset == 'imagenet':
     netG = _netG(ngpu, nz)
+elif opt.dataset == 'cxr':
+    netG = _netG_CIFAR10(ngpu, nz)
 else:
     netG = _netG_CIFAR10(ngpu, nz)
+
 netG.apply(weights_init)
 if opt.netG != '':
     netG.load_state_dict(torch.load(opt.netG))
@@ -116,8 +127,11 @@ print(netG)
 # Define the discriminator and initialize the weights
 if opt.dataset == 'imagenet':
     netD = _netD(ngpu, num_classes)
+elif opt.dataset == 'cxr':
+    netD = _netD_CIFAR10(ngpu, num_classes)
 else:
     netD = _netD_CIFAR10(ngpu, num_classes)
+
 netD.apply(weights_init)
 if opt.netD != '':
     netD.load_state_dict(torch.load(opt.netD))
@@ -130,7 +144,10 @@ aux_criterion = nn.NLLLoss()
 # tensor placeholders
 input = torch.FloatTensor(opt.batchSize, 3, opt.imageSize, opt.imageSize)
 noise = torch.FloatTensor(opt.batchSize, nz, 1, 1)
-eval_noise = torch.FloatTensor(opt.batchSize, nz, 1, 1).normal_(0, 1)
+
+eval_noise_size = 10000
+
+eval_noise = torch.FloatTensor(eval_noise_size, nz, 1, 1).normal_(0, 1)
 dis_label = torch.FloatTensor(opt.batchSize)
 aux_label = torch.LongTensor(opt.batchSize)
 real_label = 1
@@ -151,14 +168,15 @@ noise = Variable(noise)
 eval_noise = Variable(eval_noise)
 dis_label = Variable(dis_label)
 aux_label = Variable(aux_label)
+
 # noise for evaluation
-eval_noise_ = np.random.normal(0, 1, (opt.batchSize, nz))
-eval_label = np.random.randint(0, num_classes, opt.batchSize)
-eval_onehot = np.zeros((opt.batchSize, num_classes))
-eval_onehot[np.arange(opt.batchSize), eval_label] = 1
-eval_noise_[np.arange(opt.batchSize), :num_classes] = eval_onehot[np.arange(opt.batchSize)]
+eval_noise_ = np.random.normal(0, 1, (eval_noise_size, nz))
+eval_label = np.random.randint(0, num_classes, eval_noise_size)
+eval_onehot = np.zeros((eval_noise_size, num_classes))
+eval_onehot[np.arange(eval_noise_size), eval_label] = 1
+eval_noise_[np.arange(eval_noise_size), :num_classes] = eval_onehot[np.arange(eval_noise_size)]
 eval_noise_ = (torch.from_numpy(eval_noise_))
-eval_noise.data.copy_(eval_noise_.view(opt.batchSize, nz, 1, 1))
+eval_noise.data.copy_(eval_noise_.view(eval_noise_size, nz, 1, 1))
 
 # setup optimizer
 optimizerD = optim.Adam(netD.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
@@ -178,9 +196,10 @@ for epoch in range(opt.niter):
         batch_size = real_cpu.size(0)
         if opt.cuda:
             real_cpu = real_cpu.cuda()
-        input.data.resize_as_(real_cpu).copy_(real_cpu)
-        dis_label.data.resize_(batch_size).fill_(real_label)
-        aux_label.data.resize_(batch_size).copy_(label)
+        with torch.no_grad():
+            input.resize_as_(real_cpu).copy_(real_cpu)
+            dis_label.resize_(batch_size).fill_(real_label)
+            aux_label.resize_(batch_size).copy_(label)
         dis_output, aux_output = netD(input)
 
         dis_errD_real = dis_criterion(dis_output, dis_label)
@@ -193,7 +212,8 @@ for epoch in range(opt.niter):
         accuracy = compute_acc(aux_output, aux_label)
 
         # train with fake
-        noise.data.resize_(batch_size, nz, 1, 1).normal_(0, 1)
+        with torch.no_grad():
+            noise.resize_(batch_size, nz, 1, 1).normal_(0, 1)
         label = np.random.randint(0, num_classes, batch_size)
         noise_ = np.random.normal(0, 1, (batch_size, nz))
         class_onehot = np.zeros((batch_size, num_classes))
@@ -201,7 +221,8 @@ for epoch in range(opt.niter):
         noise_[np.arange(batch_size), :num_classes] = class_onehot[np.arange(batch_size)]
         noise_ = (torch.from_numpy(noise_))
         noise.data.copy_(noise_.view(batch_size, nz, 1, 1))
-        aux_label.data.resize_(batch_size).copy_(torch.from_numpy(label))
+        with torch.no_grad():
+            aux_label.resize_(batch_size).copy_(torch.from_numpy(label))
 
         fake = netG(noise)
         dis_label.data.fill_(fake_label)
@@ -232,8 +253,8 @@ for epoch in range(opt.niter):
         all_loss_G = avg_loss_G * curr_iter
         all_loss_D = avg_loss_D * curr_iter
         all_loss_A = avg_loss_A * curr_iter
-        all_loss_G += errG.data[0]
-        all_loss_D += errD.data[0]
+        all_loss_G += errG.item()
+        all_loss_D += errD.item()
         all_loss_A += accuracy
         avg_loss_G = all_loss_G / (curr_iter + 1)
         avg_loss_D = all_loss_D / (curr_iter + 1)
@@ -241,16 +262,29 @@ for epoch in range(opt.niter):
 
         print('[%d/%d][%d/%d] Loss_D: %.4f (%.4f) Loss_G: %.4f (%.4f) D(x): %.4f D(G(z)): %.4f / %.4f Acc: %.4f (%.4f)'
               % (epoch, opt.niter, i, len(dataloader),
-                 errD.data[0], avg_loss_D, errG.data[0], avg_loss_G, D_x, D_G_z1, D_G_z2, accuracy, avg_loss_A))
-        if i % 100 == 0:
-            vutils.save_image(
+                 errD.item(), avg_loss_D, errG.item(), avg_loss_G, D_x, D_G_z1, D_G_z2, accuracy, avg_loss_A))
+
+    if epoch % 5 == 0:
+        vutils.save_image(
                 real_cpu, '%s/real_samples.png' % opt.outf)
-            print('Label for eval = {}'.format(eval_label))
-            fake = netG(eval_noise)
-            vutils.save_image(
+        print('Label for eval = {}'.format(eval_label))
+        fake = netG(eval_noise)
+        vutils.save_image(
                 fake.data,
                 '%s/fake_samples_epoch_%03d.png' % (opt.outf, epoch)
             )
+
+        sdir = '%s/%03d' % (opt.outf, epoch)
+        os.makedirs(sdir, exist_ok = True)
+
+        import pickle
+        pickle.dump(eval_label, open(sdir + '/labels.pickle', 'wb')) 
+
+        for k in range(fake.data.shape[0]):
+            vutils.save_image(
+                    fake.data[k],
+                    sdir + '/%03d.png' % k
+                )
 
     # do checkpointing
     torch.save(netG.state_dict(), '%s/netG_epoch_%d.pth' % (opt.outf, epoch))
